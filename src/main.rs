@@ -933,13 +933,24 @@ fn render_html(snapshot: &LeaderboardState) -> String {
                 )
             };
             let links = render_inline_links(entry);
+            let score_tooltip = escape_html(&format!(
+                "p99 score: {} | detection score: {}",
+                entry
+                    .p99_score
+                    .map(format_number)
+                    .unwrap_or_else(|| "-".to_string()),
+                entry
+                    .detection_score
+                    .map(format_number)
+                    .unwrap_or_else(|| "-".to_string())
+            ));
 
             format!(
                 "<tr class=\"{row_class}\">\
                     <td class=\"rank\">#{rank}</td>\
                     <td><a class=\"user-link\" href=\"{issue_url}\" target=\"_blank\" rel=\"noreferrer\">{username}</a>{participant_names}{open_to_work_badge}<span class=\"muted\">issue #{issue_number}</span></td>\
                     <td>{stack}</td>\
-                    <td>{score}</td>\
+                    <td title=\"{score_tooltip}\">{score}</td>\
                     <td>{failure_rate}</td>\
                     <td>{p99}</td>\
                     <td>{cpu}</td>\
@@ -962,6 +973,7 @@ fn render_html(snapshot: &LeaderboardState) -> String {
                 issue_number = entry.issue_number,
                 participant_names = participant_names,
                 open_to_work_badge = open_to_work_badge,
+                score_tooltip = score_tooltip,
                 links = links,
                 stack = stack,
                 score = entry.final_score,
@@ -1141,6 +1153,8 @@ struct LeaderboardEntry {
     submission_repo_url: Option<String>,
     open_to_work: Option<bool>,
     final_score: i64,
+    p99_score: Option<f64>,
+    detection_score: Option<f64>,
     expected_total: i64,
     expected_legit_count: i64,
     expected_fraud_count: i64,
@@ -1188,6 +1202,8 @@ impl LeaderboardEntry {
             submission_repo_url: metadata.submission_repo_url,
             open_to_work: metadata.open_to_work,
             final_score: round_to_i64(Some(scoring.final_score))?,
+            p99_score: scoring.p99_score.as_ref().and_then(|score| score.value),
+            detection_score: scoring.detection_score.as_ref().and_then(|score| score.value),
             expected_total: round_to_i64(Some(test_results.expected.total)).unwrap_or_default(),
             expected_legit_count: round_to_i64(Some(test_results.expected.legit_count))
                 .unwrap_or_default(),
@@ -1334,8 +1350,16 @@ struct Scoring {
     weighted_errors: Option<f64>,
     #[serde(default, deserialize_with = "deserialize_optional_number")]
     error_rate_epsilon: Option<f64>,
+    p99_score: Option<ScoreContribution>,
+    detection_score: Option<ScoreContribution>,
     #[serde(deserialize_with = "deserialize_number")]
     final_score: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ScoreContribution {
+    #[serde(default, deserialize_with = "deserialize_optional_number")]
+    value: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
