@@ -25,6 +25,9 @@ const OWNER: &str = "zanfranceschi";
 const REPO: &str = "rinha-de-backend-2026";
 const RESULTS_BOT: &str = "arinhadebackend";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const CHALLENGE_URL: &str = "https://github.com/zanfranceschi/rinha-de-backend-2026";
+const MAIN_BRANCH: &str = "main";
+const SUBMISSION_BRANCH: &str = "submission";
 
 #[tokio::main]
 async fn main() {
@@ -152,7 +155,11 @@ impl GitHubClient {
                 continue;
             };
 
-            if let Some(entry) = LeaderboardEntry::from_issue_result(&sourced_issue.issue, result) {
+            let metadata = self.fetch_submission_metadata(&sourced_issue).await?;
+
+            if let Some(entry) =
+                LeaderboardEntry::from_issue_result(&sourced_issue.issue, result, metadata)
+            {
                 entries.push(entry);
             }
         }
@@ -262,13 +269,22 @@ impl GitHubClient {
         json_block: &Regex,
     ) -> Result<Option<BenchmarkResult>, AppError> {
         if let Some(stored) = self.read_stored_issue_result(issue.issue.number).await? {
-            println!(
-                "leaderboard refresh: issue #{} reused stored result without refetching comments",
-                issue.issue.number
-            );
-            return serde_json::from_str::<BenchmarkResult>(&stored.result_json)
-                .map(Some)
-                .map_err(|error| AppError::Internal(format!("invalid stored benchmark JSON: {error}")));
+            match serde_json::from_str::<BenchmarkResult>(&stored.result_json) {
+                Ok(parsed) => {
+                    println!(
+                        "leaderboard refresh: issue #{} reused stored result without refetching comments",
+                        issue.issue.number
+                    );
+                    return Ok(Some(parsed));
+                }
+                Err(error) => {
+                    println!(
+                        "leaderboard refresh: issue #{} ignored stored result with unsupported format: {}",
+                        issue.issue.number, error
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
         let url = format!(
@@ -298,13 +314,71 @@ impl GitHubClient {
             return Ok(None);
         };
 
+        let parsed = match serde_json::from_str::<BenchmarkResult>(matched_json.as_str()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                println!(
+                    "leaderboard refresh: issue #{} ignored comment with unsupported format: {}",
+                    issue.issue.number, error
+                );
+                return Ok(None);
+            }
+        };
+
         self.write_issue_result(issue.issue.number, matched_json.as_str())
             .await?;
 
-        let parsed = serde_json::from_str::<BenchmarkResult>(matched_json.as_str())
-            .map_err(|error| AppError::Internal(format!("invalid benchmark JSON: {error}")))?;
-
         Ok(Some(parsed))
+    }
+
+    async fn fetch_submission_metadata(
+        &self,
+        issue: &SourcedIssue,
+    ) -> Result<Option<SubmissionMetadata>, AppError> {
+        let policy = match issue.source {
+            IssueSource::Fresh => HttpFetchPolicy::NetworkFirst,
+            IssueSource::Cached => HttpFetchPolicy::CacheFirst,
+        };
+        let participant_url = participant_registry_url(&issue.issue.user.login);
+        let Some(participant_repos) = self
+            .get_optional_json_with_policy::<Vec<ParticipantSubmission>>(&participant_url, policy)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(participant_repo) = participant_repos.into_iter().next() else {
+            return Ok(None);
+        };
+        let participant_repo_url = sanitize_github_url(&participant_repo.repo);
+
+        let mut metadata = SubmissionMetadata {
+            participant_submission_id: Some(participant_repo.id.clone()),
+            submission_repo_url: participant_repo_url.clone(),
+            ..SubmissionMetadata::default()
+        };
+
+        let Some(info_url) = submission_info_url(&participant_repo.repo) else {
+            println!(
+                "leaderboard refresh: issue #{} has unsupported submission repo URL {}",
+                issue.issue.number, participant_repo.repo
+            );
+            return Ok(Some(metadata));
+        };
+
+        let Some(info) = self
+            .get_optional_json_with_policy::<SubmissionInfo>(&info_url, policy)
+            .await?
+        else {
+            return Ok(Some(metadata));
+        };
+
+        metadata.participant_names = info.participants;
+        metadata.submission_stack = info.stack;
+        metadata.open_to_work = info.open_to_work;
+        metadata.github_profile_url = first_social_link(&info.social, "github.com");
+        metadata.linkedin_profile_url = first_social_link(&info.social, "linkedin.com");
+
+        Ok(Some(metadata))
     }
 
     async fn get_json_with_policy<T>(&self, url: &str, policy: HttpFetchPolicy) -> Result<T, AppError>
@@ -337,6 +411,36 @@ impl GitHubClient {
         }
     }
 
+    async fn get_optional_json_with_policy<T>(
+        &self,
+        url: &str,
+        policy: HttpFetchPolicy,
+    ) -> Result<Option<T>, AppError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match policy {
+            HttpFetchPolicy::CacheFirst => {
+                if let Some(cached) = self.read_cached_entry(url).await? {
+                    return parse_json_body::<T>(&cached.body).map(Some);
+                }
+
+                let Some(body) = self.fetch_optional_body_from_network(url).await? else {
+                    return Ok(None);
+                };
+                self.write_cached_body(url, &body).await?;
+                parse_json_body::<T>(&body).map(Some)
+            }
+            HttpFetchPolicy::NetworkFirst => {
+                let Some(body) = self.fetch_optional_body_from_network(url).await? else {
+                    return Ok(None);
+                };
+                self.write_cached_body(url, &body).await?;
+                parse_json_body::<T>(&body).map(Some)
+            }
+        }
+    }
+
     async fn fetch_body_from_network(&self, url: &str) -> Result<String, AppError> {
         let response = self
             .client
@@ -355,6 +459,32 @@ impl GitHubClient {
         response
             .text()
             .await
+            .map_err(|error| AppError::Upstream(format!("GitHub response read failed: {error}")))
+    }
+
+    async fn fetch_optional_body_from_network(&self, url: &str) -> Result<Option<String>, AppError> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| AppError::Upstream(format!("GitHub request failed: {error}")))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            return Err(AppError::Upstream(format!(
+                "GitHub returned {} for {url}",
+                response.status()
+            )));
+        }
+
+        response
+            .text()
+            .await
+            .map(Some)
             .map_err(|error| AppError::Upstream(format!("GitHub response read failed: {error}")))
     }
 
@@ -657,21 +787,116 @@ fn round_to_i64(value: Option<f64>) -> Option<i64> {
 }
 
 fn format_timestamp(value: &str) -> String {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| {
-            timestamp
-                .with_timezone(&Utc)
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string()
-        })
-        .unwrap_or_else(|_| value.to_string())
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(value) else {
+        return value.to_string();
+    };
+    format_relative_timestamp(timestamp.with_timezone(&Utc))
+}
+
+fn format_relative_timestamp(timestamp: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let delta = now.signed_duration_since(timestamp);
+
+    if delta.num_seconds() < 60 {
+        "just now".to_string()
+    } else if delta.num_minutes() < 60 {
+        format!("{}m ago", delta.num_minutes())
+    } else if delta.num_hours() < 24 {
+        format!("{}h ago", delta.num_hours())
+    } else if delta.num_days() < 30 {
+        format!("{}d ago", delta.num_days())
+    } else {
+        timestamp.format("%Y-%m-%d").to_string()
+    }
+}
+
+fn participant_registry_url(username: &str) -> String {
+    format!(
+        "https://raw.githubusercontent.com/{OWNER}/{REPO}/{MAIN_BRANCH}/participants/{username}.json"
+    )
+}
+
+fn submission_info_url(repo_url: &str) -> Option<String> {
+    let (owner, repo) = parse_github_repo_url(repo_url)?;
+    Some(format!(
+        "https://raw.githubusercontent.com/{owner}/{repo}/{SUBMISSION_BRANCH}/info.json"
+    ))
+}
+
+fn parse_github_repo_url(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim_end_matches('/');
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))?;
+    let mut segments = path.split('/');
+    let owner = segments.next()?.trim();
+    let repo = segments.next()?.trim();
+
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    Some((owner.to_string(), repo.to_string()))
+}
+
+fn first_social_link(social_links: &[String], domain: &str) -> Option<String> {
+    social_links
+        .iter()
+        .find(|link| link.contains(domain))
+        .cloned()
+}
+
+fn sanitize_github_url(url: &str) -> Option<String> {
+    parse_github_repo_url(url).map(|(owner, repo)| format!("https://github.com/{owner}/{repo}"))
+}
+
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_inline_links(entry: &LeaderboardEntry) -> String {
+    let mut items = Vec::new();
+
+    if let Some(url) = &entry.github_profile_url {
+        items.push(format!(
+            "<a class=\"icon-link\" href=\"{}\" target=\"_blank\" rel=\"noreferrer\" title=\"GitHub profile\">🐙</a>",
+            escape_html(url)
+        ));
+    }
+
+    if let Some(url) = &entry.linkedin_profile_url {
+        items.push(format!(
+            "<a class=\"icon-link\" href=\"{}\" target=\"_blank\" rel=\"noreferrer\" title=\"LinkedIn profile\">💼</a>",
+            escape_html(url)
+        ));
+    }
+
+    if let Some(url) = &entry.submission_repo_url {
+        items.push(format!(
+            "<a class=\"icon-link\" href=\"{}\" target=\"_blank\" rel=\"noreferrer\" title=\"Submission repository\">📦</a>",
+            escape_html(url)
+        ));
+    }
+
+    if items.is_empty() {
+        "<span class=\"muted\">-</span>".to_string()
+    } else {
+        format!("<div class=\"icon-links\">{}</div>", items.join(""))
+    }
 }
 
 fn render_html(snapshot: &LeaderboardState) -> String {
     let entries = &snapshot.leaderboard;
     let generated_at = snapshot
         .last_refreshed_at
-        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M UTC").to_string())
+        .map(|timestamp| format_relative_timestamp(timestamp))
         .unwrap_or_else(|| "warming up".to_string());
     let leader_score = entries.first().map(|entry| entry.final_score).unwrap_or_default();
     let status_message = snapshot
@@ -683,38 +908,66 @@ fn render_html(snapshot: &LeaderboardState) -> String {
     let rows = entries
         .iter()
         .map(|entry| {
+            let participant_names = if entry.participant_names.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<span class=\"muted\">{}</span>",
+                    escape_html(&entry.participant_names.join(", "))
+                )
+            };
+            let open_to_work_badge = if entry.open_to_work == Some(true) {
+                "<span class=\"otw-badge\">#opentowork</span>".to_string()
+            } else {
+                String::new()
+            };
+            let stack = if entry.submission_stack.is_empty() {
+                "-".to_string()
+            } else {
+                let full_stack = entry.submission_stack.join(", ");
+                let truncated_stack = truncate_with_ellipsis(&full_stack, 30);
+                format!(
+                    "<span title=\"{}\">{}</span>",
+                    escape_html(&full_stack),
+                    escape_html(&truncated_stack)
+                )
+            };
+            let links = render_inline_links(entry);
+
             format!(
-                "<tr>\
+                "<tr class=\"{row_class}\">\
                     <td class=\"rank\">#{rank}</td>\
-                    <td><a href=\"{issue_url}\" target=\"_blank\" rel=\"noreferrer\">{username}</a><span class=\"muted\">issue #{issue_number}</span></td>\
+                    <td><a class=\"user-link\" href=\"{issue_url}\" target=\"_blank\" rel=\"noreferrer\">{username}</a>{participant_names}{open_to_work_badge}<span class=\"muted\">issue #{issue_number}</span></td>\
+                    <td>{stack}</td>\
                     <td>{score}</td>\
-                    <td>{accuracy}</td>\
+                    <td>{failure_rate}</td>\
                     <td>{p99}</td>\
-                    <td>{p90}</td>\
-                    <td>{med}</td>\
                     <td>{cpu}</td>\
                     <td>{mem}</td>\
-                    <td>{http_errors}</td>\
+                    <td class=\"center-cell\">{http_errors}</td>\
                     <td title=\"{breakdown_title}\">{tp}/{tn}/{fp}/{fn}</td>\
-                    <td><code>{commit}</code></td>\
+                    <td>{weighted_errors}</td>\
+                    <td>{error_rate}</td>\
                     <td>{updated_at}</td>\
+                    <td class=\"actions-cell\">{links}</td>\
                 </tr>",
                 rank = entry.rank,
+                row_class = if entry.open_to_work == Some(true) {
+                    "open-to-work-row"
+                } else {
+                    ""
+                },
                 issue_url = escape_html(&entry.issue_url),
                 username = escape_html(&entry.username),
                 issue_number = entry.issue_number,
+                participant_names = participant_names,
+                open_to_work_badge = open_to_work_badge,
+                links = links,
+                stack = stack,
                 score = entry.final_score,
-                accuracy = escape_html(&entry.detection_accuracy),
+                failure_rate = escape_html(entry.failure_rate.as_deref().unwrap_or("-")),
                 p99 = entry
                     .p99_ms
-                    .map(|value| format!("{value:.2}ms"))
-                    .unwrap_or_else(|| "-".to_string()),
-                p90 = entry
-                    .p90_ms
-                    .map(|value| format!("{value:.2}ms"))
-                    .unwrap_or_else(|| "-".to_string()),
-                med = entry
-                    .median_ms
                     .map(|value| format!("{value:.2}ms"))
                     .unwrap_or_else(|| "-".to_string()),
                 cpu = entry
@@ -730,11 +983,18 @@ fn render_html(snapshot: &LeaderboardState) -> String {
                     "true positives: {}, true negatives: {}, false positives: {}, false negatives: {}",
                     entry.true_positives, entry.true_negatives, entry.false_positives, entry.false_negatives
                 )),
+                weighted_errors = entry
+                    .weighted_errors
+                    .map(format_number)
+                    .unwrap_or_else(|| "-".to_string()),
+                error_rate = entry
+                    .error_rate_epsilon
+                    .map(format_number)
+                    .unwrap_or_else(|| "-".to_string()),
                 tp = entry.true_positives,
                 tn = entry.true_negatives,
                 fp = entry.false_positives,
                 fn = entry.false_negatives,
-                commit = escape_html(entry.commit.as_deref().unwrap_or("-")),
                 updated_at = escape_html(&format_timestamp(&entry.created_at)),
             )
         })
@@ -756,6 +1016,7 @@ fn render_html(snapshot: &LeaderboardState) -> String {
     h1 {{ margin: 0; font-size: clamp(2rem, 3vw, 3rem); }}
     p {{ color: #b5c3de; line-height: 1.6; }}
     .hero {{ display: grid; gap: 16px; margin-bottom: 24px; }}
+    .hero-links {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; }}
     .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin: 24px 0; }}
     .card, .table-wrap {{ background: rgba(11, 20, 39, 0.88); border: 1px solid #22314f; border-radius: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.22); }}
     .card {{ padding: 20px; }}
@@ -766,13 +1027,27 @@ fn render_html(snapshot: &LeaderboardState) -> String {
     th, td {{ padding: 14px 16px; text-align: left; border-bottom: 1px solid #1b2742; vertical-align: top; }}
     th {{ position: sticky; top: 0; background: #0c1528; color: #8fa4cb; font-size: 0.8rem; text-transform: uppercase; letter-spacing: .06em; }}
     tr:hover td {{ background: rgba(21, 34, 61, 0.78); }}
-    a {{ color: #88b4ff; text-decoration: none; font-weight: 600; display: block; }}
+    .open-to-work-row td:first-child {{ box-shadow: inset 4px 0 0 #22c55e; }}
+    a {{ color: #88b4ff; text-decoration: none; font-weight: 600; }}
     a:hover {{ text-decoration: underline; }}
+    .user-link {{ display: block; }}
     .muted {{ display: block; color: #6f81a5; margin-top: 4px; font-size: 0.88rem; }}
+    .otw-badge {{ display: inline-block; margin-top: 8px; padding: 3px 8px; border-radius: 999px; background: rgba(34, 197, 94, 0.18); border: 1px solid rgba(34, 197, 94, 0.5); color: #8df0af; font-size: 0.77rem; font-weight: 700; letter-spacing: .03em; }}
     .rank {{ font-weight: 700; color: #ffd166; }}
     code {{ font-family: ui-monospace, SFMono-Regular, monospace; color: #d6e3ff; }}
     .footer {{ margin-top: 16px; color: #7f91b2; font-size: .95rem; }}
     .empty {{ padding: 32px; text-align: center; color: #9eb0cf; }}
+    .icon-links {{ display: flex; flex-wrap: nowrap; justify-content: flex-end; gap: 8px; }}
+    .icon-link {{ display: inline-flex; align-items: center; justify-content: center; min-width: 34px; height: 34px; border-radius: 999px; border: 1px solid #31466f; background: rgba(26, 41, 73, 0.88); text-decoration: none; }}
+    .icon-link:hover {{ background: rgba(40, 62, 105, 0.95); text-decoration: none; }}
+    .challenge-link {{ display: inline-flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: 14px; border: 1px solid rgba(96, 165, 250, 0.45); background: linear-gradient(135deg, rgba(30, 64, 175, 0.95), rgba(37, 99, 235, 0.88)); color: #eff6ff; text-decoration: none; box-shadow: 0 10px 28px rgba(30, 64, 175, 0.28); }}
+    .challenge-link:hover {{ background: linear-gradient(135deg, rgba(37, 99, 235, 1), rgba(59, 130, 246, 0.92)); text-decoration: none; }}
+    .challenge-copy {{ display: flex; flex-direction: column; line-height: 1.15; }}
+    .challenge-kicker {{ font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(219, 234, 254, 0.82); }}
+    .challenge-title {{ font-size: 0.96rem; font-weight: 800; color: #f8fbff; }}
+    .no-transform {{ text-transform: none; }}
+    .actions-cell {{ width: 1%; white-space: nowrap; text-align: right; }}
+    .center-cell {{ text-align: center; }}
   </style>
 </head>
 <body>
@@ -781,6 +1056,15 @@ fn render_html(snapshot: &LeaderboardState) -> String {
       <div>
         <h1>Rinha de Backend 2026 Leaderboard</h1>
         <p>All closed submissions are evaluated, and the <strong>best result per GitHub user</strong> is kept. Ranking is based on <strong>final_score</strong>, with lower p99 breaking ties.</p>
+        <div class=\"hero-links\">
+          <a class=\"challenge-link\" href=\"{challenge_url}\" target=\"_blank\" rel=\"noreferrer\" title=\"Official challenge repository\">
+            <span aria-hidden=\"true\">🏁</span>
+            <span class=\"challenge-copy\">
+              <span class=\"challenge-kicker\">Official repository</span>
+              <span class=\"challenge-title\">View the Rinha de Backend 2026 challenge</span>
+            </span>
+          </a>
+        </div>
       </div>
       <div class=\"cards\">
         <article class=\"card\"><span class=\"label\">Participants</span><span class=\"value\">{participant_count}</span></article>
@@ -799,6 +1083,7 @@ fn render_html(snapshot: &LeaderboardState) -> String {
         participant_count = entries.len(),
         leader_score = leader_score,
         generated_at = generated_at,
+        challenge_url = CHALLENGE_URL,
         status_message = escape_html(&status_message),
         table_content = if entries.is_empty() {
             "<div class=\"empty\">No leaderboard snapshot yet. The background sync may still be warming up, or GitHub may have rejected the latest refresh.</div>".to_string()
@@ -809,17 +1094,18 @@ fn render_html(snapshot: &LeaderboardState) -> String {
                         <tr>
                             <th>Rank</th>
                             <th>User</th>
+                            <th>Stack</th>
                             <th>Final score</th>
-                            <th>Accuracy</th>
+                            <th>Failure rate</th>
                             <th>P99</th>
-                            <th>P90</th>
-                            <th>Median</th>
                             <th>CPU</th>
                             <th>Mem (MB)</th>
                             <th>HTTP errors</th>
                             <th>Breakdown</th>
-                            <th>Commit</th>
+                            <th>Weighted errors</th>
+                            <th>Error rate <span class=\"no-transform\">ε</span></th>
                             <th>Issue time</th>
+                            <th>Links</th>
                         </tr>
                     </thead>
                     <tbody>{rows}</tbody>
@@ -847,13 +1133,22 @@ struct LeaderboardEntry {
     issue_url: String,
     issue_title: String,
     created_at: String,
+    participant_names: Vec<String>,
+    participant_submission_id: Option<String>,
+    submission_stack: Vec<String>,
+    github_profile_url: Option<String>,
+    linkedin_profile_url: Option<String>,
+    submission_repo_url: Option<String>,
+    open_to_work: Option<bool>,
     final_score: i64,
-    raw_score: Option<i64>,
-    detection_accuracy: String,
-    latency_multiplier: Option<f64>,
+    expected_total: i64,
+    expected_legit_count: i64,
+    expected_fraud_count: i64,
+    expected_edge_case_count: i64,
+    failure_rate: Option<String>,
+    weighted_errors: Option<f64>,
+    error_rate_epsilon: Option<f64>,
     p99_ms: Option<f64>,
-    p90_ms: Option<f64>,
-    median_ms: Option<f64>,
     true_positives: i64,
     true_negatives: i64,
     false_positives: i64,
@@ -865,10 +1160,18 @@ struct LeaderboardEntry {
 }
 
 impl LeaderboardEntry {
-    fn from_issue_result(issue: &GitHubIssue, result: BenchmarkResult) -> Option<Self> {
-        let scoring = result.test_results.scoring?;
-        let response_times = result.test_results.response_times;
-        let breakdown = scoring.breakdown.unwrap_or_default();
+    fn from_issue_result(
+        issue: &GitHubIssue,
+        result: BenchmarkResult,
+        metadata: Option<SubmissionMetadata>,
+    ) -> Option<Self> {
+        let metadata = metadata.unwrap_or_default();
+        let BenchmarkResult {
+            runtime_info,
+            test_results,
+        } = result;
+        let scoring = test_results.scoring;
+        let breakdown = scoring.breakdown;
 
         Some(Self {
             rank: 0,
@@ -877,23 +1180,37 @@ impl LeaderboardEntry {
             issue_url: issue.html_url.clone(),
             issue_title: issue.title.clone(),
             created_at: issue.created_at.clone(),
-            final_score: round_to_i64(scoring.final_score)?,
-            raw_score: round_to_i64(scoring.raw_score),
-            detection_accuracy: scoring
-                .detection_accuracy
-                .unwrap_or_else(|| "-".to_string()),
-            latency_multiplier: scoring.latency_multiplier,
-            p99_ms: parse_ms(response_times.p99.as_deref()),
-            p90_ms: parse_ms(response_times.p90.as_deref()),
-            median_ms: parse_ms(response_times.med.as_deref()),
-            true_positives: round_to_i64(breakdown.true_positive_detections).unwrap_or_default(),
-            true_negatives: round_to_i64(breakdown.true_negative_detections).unwrap_or_default(),
-            false_positives: round_to_i64(breakdown.false_positive_detections).unwrap_or_default(),
-            false_negatives: round_to_i64(breakdown.false_negative_detections).unwrap_or_default(),
-            http_errors: round_to_i64(breakdown.http_errors).unwrap_or_default(),
-            cpu: result.runtime_info.cpu,
-            memory_mb: result.runtime_info.mem,
-            commit: result.runtime_info.commit,
+            participant_names: metadata.participant_names,
+            participant_submission_id: metadata.participant_submission_id,
+            submission_stack: metadata.submission_stack,
+            github_profile_url: metadata.github_profile_url,
+            linkedin_profile_url: metadata.linkedin_profile_url,
+            submission_repo_url: metadata.submission_repo_url,
+            open_to_work: metadata.open_to_work,
+            final_score: round_to_i64(Some(scoring.final_score))?,
+            expected_total: round_to_i64(Some(test_results.expected.total)).unwrap_or_default(),
+            expected_legit_count: round_to_i64(Some(test_results.expected.legit_count))
+                .unwrap_or_default(),
+            expected_fraud_count: round_to_i64(Some(test_results.expected.fraud_count))
+                .unwrap_or_default(),
+            expected_edge_case_count: round_to_i64(Some(test_results.expected.edge_case_count))
+                .unwrap_or_default(),
+            failure_rate: scoring.failure_rate,
+            weighted_errors: scoring.weighted_errors,
+            error_rate_epsilon: scoring.error_rate_epsilon,
+            p99_ms: parse_ms(Some(test_results.p99.as_str())),
+            true_positives: round_to_i64(Some(breakdown.true_positive_detections))
+                .unwrap_or_default(),
+            true_negatives: round_to_i64(Some(breakdown.true_negative_detections))
+                .unwrap_or_default(),
+            false_positives: round_to_i64(Some(breakdown.false_positive_detections))
+                .unwrap_or_default(),
+            false_negatives: round_to_i64(Some(breakdown.false_negative_detections))
+                .unwrap_or_default(),
+            http_errors: round_to_i64(Some(breakdown.http_errors)).unwrap_or_default(),
+            cpu: Some(runtime_info.cpu),
+            memory_mb: Some(runtime_info.mem),
+            commit: Some(runtime_info.commit),
         })
     }
 }
@@ -920,6 +1237,34 @@ struct GitHubUser {
     login: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SubmissionMetadata {
+    participant_names: Vec<String>,
+    participant_submission_id: Option<String>,
+    submission_stack: Vec<String>,
+    github_profile_url: Option<String>,
+    linkedin_profile_url: Option<String>,
+    submission_repo_url: Option<String>,
+    open_to_work: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ParticipantSubmission {
+    id: String,
+    repo: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SubmissionInfo {
+    #[serde(default)]
+    participants: Vec<String>,
+    #[serde(default)]
+    social: Vec<String>,
+    #[serde(default)]
+    stack: Vec<String>,
+    open_to_work: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct BenchmarkResult {
     #[serde(rename = "runtime-info")]
@@ -928,13 +1273,30 @@ struct BenchmarkResult {
     test_results: TestResults,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct RuntimeInfo {
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    mem: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    cpu: Option<f64>,
-    commit: Option<String>,
+    #[serde(deserialize_with = "deserialize_number")]
+    mem: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    cpu: f64,
+    commit: String,
+}
+
+fn deserialize_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .ok_or_else(|| serde::de::Error::custom("invalid numeric value")),
+        serde_json::Value::String(raw) => raw
+            .parse::<f64>()
+            .map_err(|_| serde::de::Error::custom("invalid numeric string")),
+        _ => Err(serde::de::Error::custom("expected numeric value")),
+    }
 }
 
 fn deserialize_optional_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -957,43 +1319,49 @@ where
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct TestResults {
-    #[serde(default)]
-    response_times: ResponseTimes,
-    scoring: Option<Scoring>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct ResponseTimes {
-    p99: Option<String>,
-    p90: Option<String>,
-    med: Option<String>,
+    expected: ExpectedResults,
+    p99: String,
+    scoring: Scoring,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct Scoring {
-    breakdown: Option<Breakdown>,
-    detection_accuracy: Option<String>,
-    latency_multiplier: Option<f64>,
+    breakdown: Breakdown,
+    failure_rate: Option<String>,
+    #[serde(rename = "weighted_errors_E", default, deserialize_with = "deserialize_optional_number")]
+    weighted_errors: Option<f64>,
     #[serde(default, deserialize_with = "deserialize_optional_number")]
-    raw_score: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    final_score: Option<f64>,
+    error_rate_epsilon: Option<f64>,
+    #[serde(deserialize_with = "deserialize_number")]
+    final_score: f64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+struct ExpectedResults {
+    #[serde(deserialize_with = "deserialize_number")]
+    total: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    fraud_count: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    legit_count: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    edge_case_count: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct Breakdown {
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    false_positive_detections: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    false_negative_detections: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    true_positive_detections: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    true_negative_detections: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_number")]
-    http_errors: Option<f64>,
+    #[serde(deserialize_with = "deserialize_number")]
+    false_positive_detections: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    false_negative_detections: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    true_positive_detections: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    true_negative_detections: f64,
+    #[serde(deserialize_with = "deserialize_number")]
+    http_errors: f64,
 }
 
 #[derive(Clone, Debug)]
